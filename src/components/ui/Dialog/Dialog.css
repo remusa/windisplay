@@ -43,6 +43,7 @@
   border: 1px solid var(--panel-border-strong);
   box-shadow: var(--dialog-shadow);
   border-radius: 13px;
+  overflow: hidden;
   z-index: 9999;
   animation: slideIn 80ms ease-out;
 }

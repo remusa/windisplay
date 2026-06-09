@@ -29,12 +29,7 @@ export function DisplayOrientationIcon({
   const normalizedOrientation = ((orientation % 360) + 360) % 360;
   const gap = 0; // space between monitor outline and base bar
 
-  // Because we rotate the whole icon, 90/270 swaps the displayed width/height.
-  // Invert the layout aspect in those cases so the final on-screen rectangle matches aspectRatioKey.
-  const layoutAspect =
-    normalizedOrientation === 90 || normalizedOrientation === 270
-      ? 1 / aspect
-      : aspect;
+  const layoutAspect = aspect;
 
   // First pass: approximate rect size within base content, to estimate bar thickness.
   const approxRectWidth =
@@ -186,23 +181,23 @@ export function DisplayOrientationIcon({
           strokeWidth={strokeWidth}
         />
 
-        {/* Centered letter */}
-        <text
-          x={cx}
-          y={cy}
-          textAnchor="middle"
-          dominantBaseline="central"
-          fontSize={Math.max(8, Math.min(rectWidth, rectHeight) * 0.7)}
-          fontWeight={500}
-          fill={stroke}
-          fontFamily="system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, Cantarell, Noto Sans, Arial, sans-serif"
-        >
-          A
-        </text>
-
         {/* External base bar with rounding only on the far side */}
         <path d={barPathD} fill={barFill} stroke="none" />
       </g>
+
+      {/* The letter stays upright while the monitor and its lower edge rotate. */}
+      <text
+        x={cx}
+        y={cy}
+        textAnchor="middle"
+        dominantBaseline="central"
+        fontSize={Math.max(8, Math.min(rectWidth, rectHeight) * 0.7)}
+        fontWeight={500}
+        fill={stroke}
+        fontFamily="system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, Cantarell, Noto Sans, Arial, sans-serif"
+      >
+        A
+      </text>
     </svg>
   );
 }

@@ -2,9 +2,11 @@
 
 All notable changes to this project will be documented in this file.
 
-## [0.3.21] - 2026-05-30
+## [0.3.21] - 2026-06-09
 
 - [#18](https://github.com/zpix1/windisplay/pull/18) Improve tray responsiveness, expose an option to hide controls when the window loses focus, and disable brightness controls while HDR is enabled by @Cesarsk
+- Minimal CSS and label fixes
+- Monitor rotation icon fixes
 
 ## [0.3.20] - 2026-04-02
 
@@ -47,7 +49,7 @@ All notable changes to this project will be documented in this file.
 
 - Added settings page
 - Added option to keyboard brightness keys for brightness control
-- Added option to automatically show UI when a monitor is connected or disconnected
+- Added option to show controls when a monitor is connected or disconnected
 
 ## [0.3.10] - 2025-11-01
 

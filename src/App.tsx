@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import "./App.css";
 import IdentifyMonitorsButton from "./components/IdentifyMonitorsButton";
 import MonitorControls from "./components/MonitorControls";
@@ -65,25 +65,6 @@ function App() {
     return () => media.removeEventListener("change", handleChange);
   }, [settings.theme]);
 
-  const handleMonitorChange = useCallback((deviceName: string) => {
-    setSelectedDeviceName(deviceName);
-  }, []);
-
-  const handleOpenSettings = useCallback(() => {
-    setIsSettingsOpen(true);
-  }, []);
-
-  const handleCloseSettings = useCallback(() => {
-    setIsSettingsOpen(false);
-  }, []);
-
-  const handleError = useCallback(
-    (msg: string) => {
-      setError(msg);
-    },
-    [setError]
-  );
-
   return (
     <div className="app-root">
       {error && <ErrorToast message={error} onClose={() => setError(null)} />}
@@ -101,14 +82,14 @@ function App() {
               ariaLabel="Select monitor"
               items={monitors}
               selectedItem={selectedMonitor}
-              onChange={(m) => handleMonitorChange(m.device_name)}
+              onChange={(m) => setSelectedDeviceName(m.device_name)}
               getKey={(m) => m.device_name}
               getLabel={(m) => monitors.indexOf(m) + 1}
               disabled={loading}
             />
             <button
               className="cog-button"
-              onClick={handleOpenSettings}
+              onClick={() => setIsSettingsOpen(true)}
               aria-label="Open settings"
             >
               <CogIcon size={20} />
@@ -118,7 +99,7 @@ function App() {
           <div className="monitor-selector-container single-button">
             <button
               className="cog-button standalone"
-              onClick={handleOpenSettings}
+              onClick={() => setIsSettingsOpen(true)}
               aria-label="Open settings"
             >
               <CogIcon size={20} />
@@ -144,7 +125,7 @@ function App() {
               <MonitorControls
                 monitor={selectedMonitor}
                 disabled={loading}
-                onError={handleError}
+                onError={setError}
               />
             </div>
           </>
@@ -157,7 +138,7 @@ function App() {
 
       <Settings
         isOpen={isSettingsOpen}
-        onClose={handleCloseSettings}
+        onClose={() => setIsSettingsOpen(false)}
       />
     </div>
   );
