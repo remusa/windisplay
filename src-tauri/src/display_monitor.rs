@@ -27,6 +27,7 @@ unsafe extern "system" fn window_proc(
             // Display configuration changed
             if let Ok(guard) = APP_HANDLE.lock() {
                 if let Some(app) = guard.as_ref() {
+                    crate::winDisplays::invalidate_display_metadata_caches();
                     let _ = app.emit("display-changed", ());
                     // Optionally reveal UI if user enabled it in settings
                     if crate::settings::should_show_ui_on_monitor_change_handle(app) {

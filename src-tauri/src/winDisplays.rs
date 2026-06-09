@@ -173,6 +173,15 @@ fn cache_edid_metadata(entries: &[PsEdidEntry]) {
     }
 }
 
+pub fn invalidate_display_metadata_caches() {
+    if let Ok(mut cache) = cached_edid_metadata().lock() {
+        *cache = None;
+    }
+    if let Ok(mut cache) = input_switch_support_cache().lock() {
+        cache.clear();
+    }
+}
+
 fn to_lower(s: &str) -> String {
     s.to_ascii_lowercase()
 }

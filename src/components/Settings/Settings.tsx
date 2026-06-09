@@ -101,7 +101,7 @@ export function Settings({ isOpen, onClose }: SettingsProps) {
                 Brightness Keys Affect:{" "}
                 <span
                   className="settings-section-title-note"
-                  title="We use F14/F15 for brightness adjustment. You can bind these keys to the brightness up/down keys in your keyboard settings. Please note that brighness Windows API is very slow, so it might feel laggy."
+                  title={`We use F14/F15 for brightness adjustment.\nYou can bind these keys to the brightness up/down keys in your keyboard settings.\nPlease note that brighness Windows API is very slow, so it might feel laggy.`}
                 >
                   (?)
                 </span>
@@ -162,8 +162,7 @@ export function Settings({ isOpen, onClose }: SettingsProps) {
                   className="settings-checkbox"
                 />
                 <span className="settings-checkbox-text">
-                  Automatically show UI when a monitor is connected or
-                  disconnected
+                  Show controls when a monitor is connected or disconnected
                 </span>
               </label>
             </div>
