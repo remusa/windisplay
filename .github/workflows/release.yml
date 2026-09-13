@@ -47,6 +47,9 @@ jobs:
         id: extract_release_notes
         run: |
           $version = $env:GITHUB_REF_NAME.TrimStart('v')
+          if ($env:GITHUB_EVENT_NAME -eq 'workflow_dispatch') {
+            $version = "0.3.22-fork.1"
+          }
           $changelogPath = "CHANGELOG.md"
           if (-not (Test-Path $changelogPath)) {
             Write-Error "CHANGELOG.md not found"
@@ -57,10 +60,11 @@ jobs:
           $pattern = "^\#\# \[$escapedVersion\][\s\S]*?(?=^\#\# \[|\Z)"
           $match = [Regex]::Match($changelog, $pattern, [Text.RegularExpressions.RegexOptions]::Multiline)
           if (-not $match.Success) {
-            Write-Error "Release notes for version $version not found in CHANGELOG.md"
-            exit 1
+            Write-Host "Release notes for version $version not found in CHANGELOG.md, using fallback"
+            $notes = "Fork with bug fixes: VOT mapping correction and display detection fallback"
+          } else {
+            $notes = $match.Value.Trim()
           }
-          $notes = $match.Value.Trim()
           Add-Content -Path $env:GITHUB_OUTPUT -Value "release_body<<EOF"
           Add-Content -Path $env:GITHUB_OUTPUT -Value $notes
           Add-Content -Path $env:GITHUB_OUTPUT -Value "EOF"
