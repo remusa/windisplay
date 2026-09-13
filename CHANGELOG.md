@@ -2,6 +2,11 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.3.22-fork.1] - 2026-09-13
+
+- Fix VideoOutputTechnology mapping: values 1-7 were shifted vs D3DKMDT standard (e.g., VOT=5 is DVI not HDMI)
+- Add EnumDisplayMonitors fallback for display detection to find monitors missed by EnumDisplayDevicesW when DISPLAY_DEVICE_ATTACHED_TO_DESKTOP is not set (fixes missing monitors on DisplayPort)
+
 ## [0.3.21] - 2026-06-09
 
 - [#18](https://github.com/zpix1/windisplay/pull/18) Improve tray responsiveness, expose an option to hide controls when the window loses focus, and disable brightness controls while HDR is enabled by @Cesarsk
