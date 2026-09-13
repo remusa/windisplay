@@ -623,12 +623,13 @@ fn get_all_monitors_windows() -> Result<Vec<DisplayInfo>, String> {
                     -2 => "Uninitialized".to_string(),
                     -1 => "Other".to_string(),
                     0 => "VGA".to_string(),
-                    1 => "S-Video".to_string(),
-                    2 => "Composite".to_string(),
-                    3 => "Component".to_string(),
-                    4 => "DVI".to_string(),
-                    5 => "HDMI".to_string(),
-                    6 => "LVDS / MIPI-DSI".to_string(),
+                    1 => "SVGA".to_string(),
+                    2 => "S-Video".to_string(),
+                    3 => "Composite".to_string(),
+                    4 => "Component".to_string(),
+                    5 => "DVI".to_string(),
+                    6 => "HDMI".to_string(),
+                    7 => "LVDS / MIPI-DSI".to_string(),
                     8 => "D-Jpn".to_string(),
                     9 => "SDI".to_string(),
                     10 => "DisplayPort (external)".to_string(),
@@ -720,6 +721,339 @@ fn get_all_monitors_windows() -> Result<Vec<DisplayInfo>, String> {
 
         logical_display_index += 1;
         device_index += 1;
+    }
+
+    // Fallback: use EnumDisplayMonitors to find monitors missed by EnumDisplayDevicesW
+    // This handles cases where a display device isn't flagged as ATTACHED_TO_DESKTOP
+    // but a monitor is still active (common with some Samsung/DP setups).
+    {
+        use std::mem::{size_of, zeroed};
+        use windows::Win32::Foundation::{BOOL, LPARAM, RECT};
+        use windows::Win32::Graphics::Gdi::{
+            EnumDisplayDevicesW, EnumDisplayMonitors, EnumDisplaySettingsExW, GetMonitorInfoW,
+            DISPLAY_DEVICEW, HDC, HMONITOR, MONITORINFOEXW,
+        };
+
+        struct FallbackCtx<'a> {
+            displays: &'a mut Vec<DisplayInfo>,
+            used_edid: &'a mut Vec<bool>,
+            edid_entries: &'a [PsEdidEntry],
+            logical_display_index: usize,
+            hdr_displays: &'a [crate::winHdr::Display],
+        }
+
+        unsafe extern "system" fn enum_fallback_proc(
+            hmonitor: HMONITOR,
+            _hdc: HDC,
+            _rc: *mut RECT,
+            lparam: LPARAM,
+        ) -> BOOL {
+            let ctx = &mut *(lparam.0 as *mut FallbackCtx);
+            let mut mi: MONITORINFOEXW = zeroed();
+            mi.monitorInfo.cbSize = size_of::<MONITORINFOEXW>() as u32;
+            if !GetMonitorInfoW(hmonitor, &mut mi as *mut _ as *mut _).as_bool() {
+                return BOOL(1);
+            }
+            let device_name = widestr_to_string(&mi.szDevice);
+
+            // Skip if already processed by the main loop
+            if ctx.displays.iter().any(|d| d.device_name == device_name) {
+                return BOOL(1);
+            }
+
+            log::debug!(
+                "Fallback: found monitor '{}' via EnumDisplayMonitors, not in main loop",
+                device_name
+            );
+
+            // Get current mode
+            let mut current_mode: DEVMODEW = zeroed();
+            current_mode.dmSize = size_of::<DEVMODEW>() as u16;
+            let device_name_wide = to_wide_null_terminated(&device_name);
+            let ok_current: BOOL = EnumDisplaySettingsExW(
+                windows::core::PCWSTR(device_name_wide.as_ptr()),
+                windows::Win32::Graphics::Gdi::ENUM_CURRENT_SETTINGS,
+                &mut current_mode,
+                windows::Win32::Graphics::Gdi::ENUM_DISPLAY_SETTINGS_FLAGS(0),
+            );
+            if !ok_current.as_bool() {
+                log::warn!("Fallback: EnumDisplaySettingsExW failed for '{}'", device_name);
+                return BOOL(1);
+            }
+
+            let (pos_x, pos_y) = (
+                current_mode.Anonymous1.Anonymous2.dmPosition.x,
+                current_mode.Anonymous1.Anonymous2.dmPosition.y,
+            );
+            let is_primary = (mi.monitorInfo.dwFlags & 1) != 0;
+
+            // Get monitor device ID for EDID matching
+            let mut dd_device_id = String::new();
+            let mut friendly_name = "Generic PnP Monitor".to_string();
+            {
+                let mut mon_dev: DISPLAY_DEVICEW = zeroed();
+                mon_dev.cb = size_of::<DISPLAY_DEVICEW>() as u32;
+                let ok_mon = EnumDisplayDevicesW(
+                    windows::core::PCWSTR(to_wide_null_terminated(&device_name).as_ptr()),
+                    0,
+                    &mut mon_dev,
+                    0,
+                );
+                if ok_mon.as_bool() {
+                    dd_device_id = widestr_to_string(&mon_dev.DeviceID);
+                    let mon_name = widestr_to_string(&mon_dev.DeviceString);
+                    if !mon_name.is_empty() {
+                        friendly_name = mon_name;
+                    }
+                }
+            }
+
+            // Try to match EDID metadata
+            let devid_l = to_lower(&dd_device_id);
+            let friendly_l = to_lower(&friendly_name);
+            let mut chosen_idx: Option<usize> = None;
+
+            for (idx, e) in ctx.edid_entries.iter().enumerate() {
+                if ctx.used_edid[idx] {
+                    continue;
+                }
+                if let Some(inst) = &e.InstanceName {
+                    let inst_l = to_lower(inst);
+                    if !inst_l.is_empty()
+                        && (devid_l.contains(&inst_l) || inst_l.contains(&devid_l))
+                    {
+                        chosen_idx = Some(idx);
+                        break;
+                    }
+                    if let Some(pos1) = inst_l.find('\\') {
+                        if let Some(rest) = inst_l.get(pos1 + 1..) {
+                            let frag = match rest.find('\\') {
+                                Some(p) => &rest[..p],
+                                None => rest,
+                            };
+                            if !frag.is_empty() && devid_l.contains(frag) {
+                                chosen_idx = Some(idx);
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            if chosen_idx.is_none() {
+                for (idx, e) in ctx.edid_entries.iter().enumerate() {
+                    if ctx.used_edid[idx] {
+                        continue;
+                    }
+                    let mdl = to_lower(&e.Model);
+                    let mfr = to_lower(&e.Manufacturer);
+                    if (!mdl.is_empty()
+                        && (friendly_l.contains(&mdl) || devid_l.contains(&mdl)))
+                        || (!mfr.is_empty()
+                            && (friendly_l.contains(&mfr) || devid_l.contains(&mfr)))
+                    {
+                        chosen_idx = Some(idx);
+                        break;
+                    }
+                }
+            }
+
+            let mut model = String::new();
+            let mut manufacturer = String::new();
+            let mut serial = String::new();
+            let mut connection = String::new();
+            let mut year_of_manufacture: u32 = 0;
+            let mut week_of_manufacture: u32 = 0;
+            let mut built_in = false;
+            let mut active = false;
+
+            if let Some(idx) = chosen_idx {
+                ctx.used_edid[idx] = true;
+                let e = &ctx.edid_entries[idx];
+                log::debug!(
+                    "Fallback: EDID matched for '{}' using entry index={} model='{}'",
+                    device_name,
+                    idx,
+                    e.Model
+                );
+                model = e.Model.clone();
+                manufacturer = e.Manufacturer.clone();
+                serial = e.SerialNumber.clone();
+                year_of_manufacture = e.YearOfManufacture.unwrap_or(0);
+                week_of_manufacture = e.WeekOfManufacture.unwrap_or(0);
+                if let Some(code) = e.VideoOutputTechnology {
+                    connection = match code as i64 {
+                        -2 => "Uninitialized".to_string(),
+                        -1 => "Other".to_string(),
+                        0 => "VGA".to_string(),
+                        1 => "SVGA".to_string(),
+                        2 => "S-Video".to_string(),
+                        3 => "Composite".to_string(),
+                        4 => "Component".to_string(),
+                        5 => "DVI".to_string(),
+                        6 => "HDMI".to_string(),
+                        7 => "LVDS / MIPI-DSI".to_string(),
+                        8 => "D-Jpn".to_string(),
+                        9 => "SDI".to_string(),
+                        10 => "DisplayPort (external)".to_string(),
+                        11 => "DisplayPort (embedded)".to_string(),
+                        12 => "UDI (external)".to_string(),
+                        13 => "UDI (embedded)".to_string(),
+                        14 => "SDTV dongle".to_string(),
+                        15 => "Miracast (wireless)".to_string(),
+                        16 => "Indirect (wired)".to_string(),
+                        2147483648 => "Internal (adapter)".to_string(),
+                        other => format!("Unknown ({})", other),
+                    };
+                    built_in = matches!(code, 6 | 11 | 13 | 2147483648);
+                }
+                active = e.Active.unwrap_or(false);
+            }
+
+            let scale_factor: f32 = get_monitor_scale_for_device(&device_name);
+            let scales: Vec<ScaleInfo> =
+                get_scales_for_device(&device_name).unwrap_or_default();
+
+            let hdr_status = match ctx.hdr_displays.get(ctx.logical_display_index) {
+                Some(h) => match h.status {
+                    crate::winHdr::Status::Unsupported => "unsupported".to_string(),
+                    crate::winHdr::Status::Off => "off".to_string(),
+                    crate::winHdr::Status::On => "on".to_string(),
+                },
+                None => "unsupported".to_string(),
+            };
+
+            let current = Resolution {
+                width: current_mode.dmPelsWidth as u32,
+                height: current_mode.dmPelsHeight as u32,
+                bits_per_pixel: current_mode.dmBitsPerPel as u32,
+                refresh_hz: current_mode.dmDisplayFrequency as u32,
+            };
+
+            let orientation_degrees: u32 =
+                match unsafe { current_mode.Anonymous1.Anonymous2.dmDisplayOrientation } {
+                    windows::Win32::Graphics::Gdi::DMDO_90 => 90,
+                    windows::Win32::Graphics::Gdi::DMDO_180 => 180,
+                    windows::Win32::Graphics::Gdi::DMDO_270 => 270,
+                    _ => 0,
+                };
+
+            let mut modes: Vec<Resolution> = Vec::new();
+            let mut mode_index: u32 = 0;
+            loop {
+                let mut dm: DEVMODEW = zeroed();
+                dm.dmSize = size_of::<DEVMODEW>() as u16;
+                let device_name_wide = to_wide_null_terminated(&device_name);
+                let ok_mode: BOOL = EnumDisplaySettingsExW(
+                    windows::core::PCWSTR(device_name_wide.as_ptr()),
+                    windows::Win32::Graphics::Gdi::ENUM_DISPLAY_SETTINGS_MODE(mode_index),
+                    &mut dm,
+                    windows::Win32::Graphics::Gdi::ENUM_DISPLAY_SETTINGS_FLAGS(0),
+                );
+                if !ok_mode.as_bool() {
+                    break;
+                }
+                let res = Resolution {
+                    width: dm.dmPelsWidth as u32,
+                    height: dm.dmPelsHeight as u32,
+                    bits_per_pixel: dm.dmBitsPerPel as u32,
+                    refresh_hz: dm.dmDisplayFrequency as u32,
+                };
+                if !modes.iter().any(|m| {
+                    m.width == res.width
+                        && m.height == res.height
+                        && m.bits_per_pixel == res.bits_per_pixel
+                        && m.refresh_hz == res.refresh_hz
+                }) {
+                    modes.push(res);
+                }
+                mode_index += 1;
+            }
+
+            let max_native = if let Some((nw, nh)) =
+                query_preferred_native_resolution(&device_name)
+            {
+                modes
+                    .iter()
+                    .filter(|m| m.width == nw && m.height == nh)
+                    .cloned()
+                    .max_by_key(|m| m.refresh_hz)
+                    .unwrap_or(Resolution {
+                        width: nw,
+                        height: nh,
+                        bits_per_pixel: current.bits_per_pixel,
+                        refresh_hz: current.refresh_hz,
+                    })
+            } else {
+                modes
+                    .iter()
+                    .cloned()
+                    .max_by_key(|m| (m.width as u64) * (m.height as u64))
+                    .unwrap_or_else(|| current.clone())
+            };
+
+            let enabled = get_monitor_power_status_windows(&device_name).unwrap_or(true);
+
+            let supports_input_switch: Option<bool> =
+                has_vcp_60_windows(device_name.clone()).ok();
+
+            ctx.displays.push(DisplayInfo {
+                device_name,
+                friendly_name,
+                is_primary,
+                position_x: pos_x,
+                position_y: pos_y,
+                orientation: orientation_degrees,
+                current,
+                modes,
+                max_native,
+                model,
+                serial,
+                manufacturer,
+                year_of_manufacture,
+                week_of_manufacture,
+                connection,
+                built_in,
+                active,
+                enabled,
+                scale: scale_factor,
+                scales,
+                hdr_status,
+                supports_input_switch,
+            });
+
+            log::info!(
+                "Fallback monitor {}: '{}' primary={} pos=({}, {}) current={}x{}@{}Hz connection='{}'",
+                ctx.logical_display_index,
+                ctx.displays.last().unwrap().friendly_name,
+                is_primary,
+                pos_x,
+                pos_y,
+                ctx.displays.last().unwrap().current.width,
+                ctx.displays.last().unwrap().current.height,
+                ctx.displays.last().unwrap().current.refresh_hz,
+                ctx.displays.last().unwrap().connection,
+            );
+
+            ctx.logical_display_index += 1;
+            BOOL(1)
+        }
+
+        let mut ctx = FallbackCtx {
+            displays: &mut displays,
+            used_edid: &mut used_edid,
+            edid_entries: &edid_entries,
+            logical_display_index,
+            hdr_displays: &hdr_displays,
+        };
+        unsafe {
+            let _ = EnumDisplayMonitors(
+                HDC(0),
+                None,
+                Some(enum_fallback_proc),
+                LPARAM(&mut ctx as *mut _ as isize),
+            );
+        }
+        logical_display_index = ctx.logical_display_index;
     }
 
     log::info!(
