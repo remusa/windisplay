@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.3.23-fork.1] - 2026-09-14
+
+- Revert VideoOutputTechnology mapping to true D3DKMDT values per `d3dkmdt.h` (DVI=4, HDMI=5, DisplayPort external=10); the 0.3.22-fork.1 mapping was wrong
+- Fix monitor identity: match EDID entries against live DisplayConfig target identity (EDID product code + UID) instead of trusting the GDI monitor DeviceID, which can be a stale ghost after topology/power changes and mislabeled the active display
+- Add EnumDisplayMonitors fallback for display detection to find monitors missed by EnumDisplayDevicesW when DISPLAY_DEVICE_ATTACHED_TO_DESKTOP is not set
+
 ## [0.3.22-fork.1] - 2026-09-13
 
 - Fix VideoOutputTechnology mapping: values 1-7 were shifted vs D3DKMDT standard (e.g., VOT=5 is DVI not HDMI)
