@@ -2,6 +2,10 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.3.24-fork.1] - 2026-09-14
+
+- Fix startup crash (exit 101): remove updater plugin registration and capability, the fork ships no updater config/signing keys
+
 ## [0.3.23-fork.1] - 2026-09-14
 
 - Revert VideoOutputTechnology mapping to true D3DKMDT values per `d3dkmdt.h` (DVI=4, HDMI=5, DisplayPort external=10); the 0.3.22-fork.1 mapping was wrong
