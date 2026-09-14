@@ -335,6 +335,223 @@ if ($results) { $results | ConvertTo-Json -Depth 4 } else { '[]' }
     entries
 }
 
+/// Live monitor identity from the active DisplayConfig paths.
+///
+/// Unlike `EnumDisplayDevicesW` monitor DeviceIDs — which can be stale ghosts
+/// left over from previous topology/power states (e.g. a powered-off ex-primary
+/// still owning the device node) — the active-path target device name comes
+/// from the miniport driver live state: real EDID product code + device path.
+struct LiveMonitorIdentity {
+    /// EDID manufacture product code, e.g. 0x7753.
+    edid_product: u16,
+    /// Kernel device path, e.g. `\\?\DISPLAY#SAM7753#...#UID4357#{...}`.
+    device_path: String,
+    /// Friendly name from live EDID, e.g. "Odyssey G81SF".
+    friendly_name: String,
+}
+
+/// Map GDI device name (e.g. `\\.\DISPLAY28`) -> live identity, active paths only.
+fn query_live_monitor_identities() -> std::collections::HashMap<String, LiveMonitorIdentity> {
+    use std::mem::{size_of, zeroed};
+    use windows::Win32::Devices::Display::{
+        DisplayConfigGetDeviceInfo, QueryDisplayConfig, DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME,
+        DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME, DISPLAYCONFIG_DEVICE_INFO_HEADER,
+        DISPLAYCONFIG_MODE_INFO, DISPLAYCONFIG_PATH_INFO, DISPLAYCONFIG_SOURCE_DEVICE_NAME,
+        DISPLAYCONFIG_TARGET_DEVICE_NAME, QDC_ONLY_ACTIVE_PATHS,
+    };
+    use windows::Win32::Foundation::ERROR_SUCCESS;
+
+    let mut map = std::collections::HashMap::new();
+    unsafe {
+        // NOTE: a size query with NULL arrays fails with ERROR_INVALID_PARAMETER
+        // on some systems; use preallocated buffers directly instead.
+        let mut num_paths: u32 = 64;
+        let mut num_modes: u32 = 512;
+        let mut paths: Vec<DISPLAYCONFIG_PATH_INFO> =
+            (0..num_paths).map(|_| zeroed()).collect();
+        let mut modes: Vec<DISPLAYCONFIG_MODE_INFO> =
+            (0..num_modes).map(|_| zeroed()).collect();
+        let err = QueryDisplayConfig(
+            QDC_ONLY_ACTIVE_PATHS,
+            &mut num_paths,
+            paths.as_mut_ptr(),
+            &mut num_modes,
+            modes.as_mut_ptr(),
+            None,
+        );
+        if err != ERROR_SUCCESS {
+            log::warn!("Live identity: QueryDisplayConfig failed: {:?}", err);
+            return map;
+        }
+        paths.truncate(num_paths as usize);
+        for path in &paths {
+            // GDI device name for this path's source (e.g. `\\.\DISPLAY28`).
+            let mut src: DISPLAYCONFIG_SOURCE_DEVICE_NAME = zeroed();
+            src.header.r#type = DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME;
+            src.header.size = size_of::<DISPLAYCONFIG_SOURCE_DEVICE_NAME>() as u32;
+            src.header.adapterId = path.sourceInfo.adapterId;
+            src.header.id = path.sourceInfo.id;
+            // NOTE: DisplayConfigGetDeviceInfo returns a raw i32 (0 = success).
+            if DisplayConfigGetDeviceInfo(
+                &mut src as *mut _ as *mut DISPLAYCONFIG_DEVICE_INFO_HEADER,
+            ) != 0
+            {
+                continue;
+            }
+            let gdi_name = widestr_to_string(&src.viewGdiDeviceName);
+            if gdi_name.is_empty() {
+                continue;
+            }
+            // Live monitor identity for this path's target.
+            let mut tgt: DISPLAYCONFIG_TARGET_DEVICE_NAME = zeroed();
+            tgt.header.r#type = DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME;
+            tgt.header.size = size_of::<DISPLAYCONFIG_TARGET_DEVICE_NAME>() as u32;
+            tgt.header.adapterId = path.targetInfo.adapterId;
+            tgt.header.id = path.targetInfo.id;
+            if DisplayConfigGetDeviceInfo(
+                &mut tgt as *mut _ as *mut DISPLAYCONFIG_DEVICE_INFO_HEADER,
+            ) != 0
+            {
+                continue;
+            }
+            map.insert(
+                gdi_name,
+                LiveMonitorIdentity {
+                    edid_product: tgt.edidProductCodeId,
+                    device_path: widestr_to_string(&tgt.monitorDevicePath),
+                    friendly_name: widestr_to_string(&tgt.monitorFriendlyDeviceName),
+                },
+            );
+        }
+    }
+    log::debug!("Live DisplayConfig identities: count={}", map.len());
+    for (gdi, live) in &map {
+        log::debug!(
+            "Live identity: '{}' -> edid product {:04X} friendly='{}' path='{}'",
+            gdi,
+            live.edid_product,
+            live.friendly_name,
+            live.device_path
+        );
+    }
+    map
+}
+
+/// Extract the `UIDdddd` unit token from a WMI instance name
+/// (`DISPLAY\SAM7753\...&UID4357_0`) or a kernel device path
+/// (`\\?\DISPLAY#SAM7753#...&UID4357#{...}`).
+fn extract_uid_token(s: &str) -> Option<String> {
+    let up = s.to_ascii_uppercase();
+    let pos = up.find("UID")?;
+    let digits: String = up[pos + 3..]
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
+    if digits.is_empty() {
+        None
+    } else {
+        Some(format!("UID{}", digits))
+    }
+}
+
+/// Match a live DisplayConfig identity against WMI EDID entries by EDID
+/// product code, using the UID unit token to disambiguate duplicate models.
+fn match_live_edid_entry(
+    live: &LiveMonitorIdentity,
+    entries: &[PsEdidEntry],
+    used: &[bool],
+) -> Option<usize> {
+    let prod = format!("{:04X}", live.edid_product);
+    let live_uid = extract_uid_token(&live.device_path);
+    for (idx, e) in entries.iter().enumerate() {
+        if used[idx] {
+            continue;
+        }
+        if !e.ProductCodeId.eq_ignore_ascii_case(&prod) {
+            continue;
+        }
+        match (&e.InstanceName, &live_uid) {
+            (Some(inst), Some(uid)) => match extract_uid_token(inst) {
+                // Same product, different unit: keep looking.
+                Some(euid) if euid != *uid => continue,
+                _ => return Some(idx),
+            },
+            _ => return Some(idx),
+        }
+    }
+    // Fallback: UID agreement alone (WMI product code occasionally empty).
+    if let Some(uid) = live_uid {
+        for (idx, e) in entries.iter().enumerate() {
+            if used[idx] {
+                continue;
+            }
+            if let Some(inst) = &e.InstanceName {
+                if extract_uid_token(inst).as_ref() == Some(&uid) {
+                    return Some(idx);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Legacy EDID matching: WMI InstanceName fragment vs GDI monitor DeviceID,
+/// then model/manufacturer presence, then index order.
+/// Only used when no live DisplayConfig identity is available; the GDI
+/// DeviceID can be stale, so live matching always takes precedence.
+fn match_legacy_edid_entry(
+    friendly_l: &str,
+    devid_l: &str,
+    entries: &[PsEdidEntry],
+    used: &[bool],
+) -> Option<usize> {
+    // 1) Prefer exact-ish match using InstanceName fragment (e.g., VENDOR+PRODUCT)
+    for (idx, e) in entries.iter().enumerate() {
+        if used[idx] {
+            continue;
+        }
+        if let Some(inst) = &e.InstanceName {
+            let inst_l = to_lower(inst);
+            // Some DeviceIDs start with MONITOR\, others with DISPLAY\. Compare loosely.
+            if !inst_l.is_empty() && (devid_l.contains(&inst_l) || inst_l.contains(devid_l)) {
+                return Some(idx);
+            }
+            // Also try matching the vendor+product fragment (between first and second backslashes)
+            if let Some(pos1) = inst_l.find('\\') {
+                if let Some(rest) = inst_l.get(pos1 + 1..) {
+                    let frag = match rest.find('\\') {
+                        Some(p) => &rest[..p],
+                        None => rest,
+                    };
+                    if !frag.is_empty() && devid_l.contains(frag) {
+                        return Some(idx);
+                    }
+                }
+            }
+        }
+    }
+    // 2) Fallback: match by model/manufacturer presence
+    for (idx, e) in entries.iter().enumerate() {
+        if used[idx] {
+            continue;
+        }
+        let mdl = to_lower(&e.Model);
+        let mfr = to_lower(&e.Manufacturer);
+        if (!mdl.is_empty() && (friendly_l.contains(&mdl) || devid_l.contains(&mdl)))
+            || (!mfr.is_empty() && (friendly_l.contains(&mfr) || devid_l.contains(&mfr)))
+        {
+            return Some(idx);
+        }
+    }
+    // 3) Fallback: assign by display index order
+    for (idx, u) in used.iter().enumerate() {
+        if !*u {
+            return Some(idx);
+        }
+    }
+    None
+}
+
 fn get_all_monitors_windows() -> Result<Vec<DisplayInfo>, String> {
     use std::mem::{size_of, zeroed};
     use windows::Win32::Foundation::BOOL;
@@ -358,6 +575,9 @@ fn get_all_monitors_windows() -> Result<Vec<DisplayInfo>, String> {
         edid_entries.len()
     );
     let mut used_edid: Vec<bool> = vec![false; edid_entries.len()];
+
+    // Live monitor identities from active DisplayConfig paths (see helper docs).
+    let live_identities = query_live_monitor_identities();
 
     let mut device_index: u32 = 0;
     loop {
@@ -545,62 +765,51 @@ fn get_all_monitors_windows() -> Result<Vec<DisplayInfo>, String> {
         let mut built_in: bool = false;
         let mut active: bool = false;
 
+        // Upgrade obviously-generic friendly names from live EDID data.
+        if friendly_name == "Generic PnP Monitor" {
+            if let Some(live) = live_identities.get(&device_name) {
+                if !live.friendly_name.is_empty() {
+                    friendly_name = live.friendly_name.clone();
+                }
+            }
+        }
         // Try to match using stable identifiers first (WMI InstanceName vs monitor DeviceID),
         // then fall back to model/manufacturer presence.
         let friendly_l = to_lower(&friendly_name);
         let devid_l = to_lower(&dd_device_id);
         let mut chosen_idx: Option<usize> = None;
-        // 1) Prefer exact-ish match using InstanceName fragment (e.g., VENDOR+PRODUCT)
-        for (idx, e) in edid_entries.iter().enumerate() {
-            if used_edid[idx] {
-                continue;
-            }
-            if let Some(inst) = &e.InstanceName {
-                let inst_l = to_lower(inst);
-                // Some DeviceIDs start with MONITOR\\, others with DISPLAY\\. Compare loosely.
-                if !inst_l.is_empty() && (devid_l.contains(&inst_l) || inst_l.contains(&devid_l)) {
+        // 0) Prefer live DisplayConfig identity: the GDI monitor DeviceID can be a
+        // stale ghost after topology/power changes, while the active-path target
+        // reflects the live EDID. When live identity exists but matches no WMI
+        // entry, leave the identity blank rather than mislabel the display.
+        let mut live_unmatched = false;
+        if let Some(live) = live_identities.get(&device_name) {
+            match match_live_edid_entry(live, &edid_entries, &used_edid) {
+                Some(idx) => {
+                    log::debug!(
+                        "Live identity matched for '{}' using entry index={} model='{}' (edid product {:04X})",
+                        device_name,
+                        idx,
+                        edid_entries[idx].Model,
+                        live.edid_product
+                    );
                     chosen_idx = Some(idx);
-                    break;
                 }
-                // Also try matching the vendor+product fragment (between first and second backslashes)
-                if let Some(pos1) = inst_l.find('\\') {
-                    if let Some(rest) = inst_l.get(pos1 + 1..) {
-                        let frag = match rest.find('\\') {
-                            Some(p) => &rest[..p],
-                            None => rest,
-                        };
-                        if !frag.is_empty() && devid_l.contains(frag) {
-                            chosen_idx = Some(idx);
-                            break;
-                        }
-                    }
+                None => {
+                    log::warn!(
+                        "Live identity for '{}' (edid product {:04X}, path '{}') matches no EDID entry; leaving identity blank",
+                        device_name,
+                        live.edid_product,
+                        live.device_path
+                    );
+                    live_unmatched = true;
                 }
             }
         }
-        // 2) Fallback: match by model/manufacturer presence
-        if chosen_idx.is_none() {
-            for (idx, e) in edid_entries.iter().enumerate() {
-                if used_edid[idx] {
-                    continue;
-                }
-                let mdl = to_lower(&e.Model);
-                let mfr = to_lower(&e.Manufacturer);
-                if (!mdl.is_empty() && (friendly_l.contains(&mdl) || devid_l.contains(&mdl)))
-                    || (!mfr.is_empty() && (friendly_l.contains(&mfr) || devid_l.contains(&mfr)))
-                {
-                    chosen_idx = Some(idx);
-                    break;
-                }
-            }
-        }
-        // Fallback: assign by display index order
-        if chosen_idx.is_none() {
-            for (idx, used) in used_edid.iter().enumerate() {
-                if !*used {
-                    chosen_idx = Some(idx);
-                    break;
-                }
-            }
+        // Legacy matching only when no live identity is available.
+        if chosen_idx.is_none() && !live_unmatched {
+            chosen_idx =
+                match_legacy_edid_entry(&friendly_l, &devid_l, &edid_entries, &used_edid);
         }
         if let Some(idx) = chosen_idx {
             used_edid[idx] = true;
@@ -617,19 +826,21 @@ fn get_all_monitors_windows() -> Result<Vec<DisplayInfo>, String> {
             serial = e.SerialNumber.clone();
             year_of_manufacture = e.YearOfManufacture.unwrap_or(0);
             week_of_manufacture = e.WeekOfManufacture.unwrap_or(0);
-            // Map VideoOutputTechnology to a friendly name similar to test.py
+            // Map VideoOutputTechnology to a friendly name.
+            // Numbering per D3DKMDT_VIDEO_OUTPUT_TECHNOLOGY (d3dkmdt.h),
+            // also used by WMI WmiMonitorConnectionParams and by
+            // DISPLAYCONFIG_VIDEO_OUTPUT_TECHNOLOGY (wingdi.h).
             if let Some(code) = e.VideoOutputTechnology {
                 connection = match code as i64 {
                     -2 => "Uninitialized".to_string(),
                     -1 => "Other".to_string(),
                     0 => "VGA".to_string(),
-                    1 => "SVGA".to_string(),
-                    2 => "S-Video".to_string(),
-                    3 => "Composite".to_string(),
-                    4 => "Component".to_string(),
-                    5 => "DVI".to_string(),
-                    6 => "HDMI".to_string(),
-                    7 => "LVDS / MIPI-DSI".to_string(),
+                    1 => "S-Video".to_string(),
+                    2 => "Composite".to_string(),
+                    3 => "Component".to_string(),
+                    4 => "DVI".to_string(),
+                    5 => "HDMI".to_string(),
+                    6 => "LVDS".to_string(),
                     8 => "D-Jpn".to_string(),
                     9 => "SDI".to_string(),
                     10 => "DisplayPort (external)".to_string(),
@@ -639,6 +850,7 @@ fn get_all_monitors_windows() -> Result<Vec<DisplayInfo>, String> {
                     14 => "SDTV dongle".to_string(),
                     15 => "Miracast (wireless)".to_string(),
                     16 => "Indirect (wired)".to_string(),
+                    17 => "Indirect (virtual)".to_string(),
                     2147483648 => "Internal (adapter)".to_string(),
                     other => format!("Unknown ({})", other),
                 };
@@ -740,6 +952,7 @@ fn get_all_monitors_windows() -> Result<Vec<DisplayInfo>, String> {
             edid_entries: &'a [PsEdidEntry],
             logical_display_index: usize,
             hdr_displays: &'a [crate::winHdr::Display],
+            live_identities: &'a std::collections::HashMap<String, LiveMonitorIdentity>,
         }
 
         unsafe extern "system" fn enum_fallback_proc(
@@ -808,53 +1021,48 @@ fn get_all_monitors_windows() -> Result<Vec<DisplayInfo>, String> {
                 }
             }
 
-            // Try to match EDID metadata
-            let devid_l = to_lower(&dd_device_id);
-            let friendly_l = to_lower(&friendly_name);
-            let mut chosen_idx: Option<usize> = None;
-
-            for (idx, e) in ctx.edid_entries.iter().enumerate() {
-                if ctx.used_edid[idx] {
-                    continue;
-                }
-                if let Some(inst) = &e.InstanceName {
-                    let inst_l = to_lower(inst);
-                    if !inst_l.is_empty()
-                        && (devid_l.contains(&inst_l) || inst_l.contains(&devid_l))
-                    {
-                        chosen_idx = Some(idx);
-                        break;
-                    }
-                    if let Some(pos1) = inst_l.find('\\') {
-                        if let Some(rest) = inst_l.get(pos1 + 1..) {
-                            let frag = match rest.find('\\') {
-                                Some(p) => &rest[..p],
-                                None => rest,
-                            };
-                            if !frag.is_empty() && devid_l.contains(frag) {
-                                chosen_idx = Some(idx);
-                                break;
-                            }
-                        }
+            // Upgrade obviously-generic friendly names from live EDID data.
+            if friendly_name == "Generic PnP Monitor" {
+                if let Some(live) = ctx.live_identities.get(&device_name) {
+                    if !live.friendly_name.is_empty() {
+                        friendly_name = live.friendly_name.clone();
                     }
                 }
             }
-            if chosen_idx.is_none() {
-                for (idx, e) in ctx.edid_entries.iter().enumerate() {
-                    if ctx.used_edid[idx] {
-                        continue;
-                    }
-                    let mdl = to_lower(&e.Model);
-                    let mfr = to_lower(&e.Manufacturer);
-                    if (!mdl.is_empty()
-                        && (friendly_l.contains(&mdl) || devid_l.contains(&mdl)))
-                        || (!mfr.is_empty()
-                            && (friendly_l.contains(&mfr) || devid_l.contains(&mfr)))
-                    {
+            // Try to match EDID metadata: live DisplayConfig identity first
+            // (GDI DeviceIDs can be stale ghosts), legacy matching only when
+            // no live identity is available.
+            let devid_l = to_lower(&dd_device_id);
+            let friendly_l = to_lower(&friendly_name);
+            let mut chosen_idx: Option<usize> = None;
+            let mut live_unmatched = false;
+            if let Some(live) = ctx.live_identities.get(&device_name) {
+                match match_live_edid_entry(live, ctx.edid_entries, ctx.used_edid) {
+                    Some(idx) => {
+                        log::debug!(
+                            "Fallback live identity matched for '{}' using entry index={} model='{}'",
+                            device_name,
+                            idx,
+                            ctx.edid_entries[idx].Model
+                        );
                         chosen_idx = Some(idx);
-                        break;
+                    }
+                    None => {
+                        log::warn!(
+                            "Fallback live identity for '{}' matches no EDID entry; leaving identity blank",
+                            device_name
+                        );
+                        live_unmatched = true;
                     }
                 }
+            }
+            if chosen_idx.is_none() && !live_unmatched {
+                chosen_idx = match_legacy_edid_entry(
+                    &friendly_l,
+                    &devid_l,
+                    ctx.edid_entries,
+                    ctx.used_edid,
+                );
             }
 
             let mut model = String::new();
@@ -881,17 +1089,19 @@ fn get_all_monitors_windows() -> Result<Vec<DisplayInfo>, String> {
                 year_of_manufacture = e.YearOfManufacture.unwrap_or(0);
                 week_of_manufacture = e.WeekOfManufacture.unwrap_or(0);
                 if let Some(code) = e.VideoOutputTechnology {
+                    // Numbering per D3DKMDT_VIDEO_OUTPUT_TECHNOLOGY (d3dkmdt.h),
+                    // also used by WMI WmiMonitorConnectionParams and by
+                    // DISPLAYCONFIG_VIDEO_OUTPUT_TECHNOLOGY (wingdi.h).
                     connection = match code as i64 {
                         -2 => "Uninitialized".to_string(),
                         -1 => "Other".to_string(),
                         0 => "VGA".to_string(),
-                        1 => "SVGA".to_string(),
-                        2 => "S-Video".to_string(),
-                        3 => "Composite".to_string(),
-                        4 => "Component".to_string(),
-                        5 => "DVI".to_string(),
-                        6 => "HDMI".to_string(),
-                        7 => "LVDS / MIPI-DSI".to_string(),
+                        1 => "S-Video".to_string(),
+                        2 => "Composite".to_string(),
+                        3 => "Component".to_string(),
+                        4 => "DVI".to_string(),
+                        5 => "HDMI".to_string(),
+                        6 => "LVDS".to_string(),
                         8 => "D-Jpn".to_string(),
                         9 => "SDI".to_string(),
                         10 => "DisplayPort (external)".to_string(),
@@ -901,6 +1111,7 @@ fn get_all_monitors_windows() -> Result<Vec<DisplayInfo>, String> {
                         14 => "SDTV dongle".to_string(),
                         15 => "Miracast (wireless)".to_string(),
                         16 => "Indirect (wired)".to_string(),
+                        17 => "Indirect (virtual)".to_string(),
                         2147483648 => "Internal (adapter)".to_string(),
                         other => format!("Unknown ({})", other),
                     };
@@ -1044,6 +1255,7 @@ fn get_all_monitors_windows() -> Result<Vec<DisplayInfo>, String> {
             edid_entries: &edid_entries,
             logical_display_index,
             hdr_displays: &hdr_displays,
+            live_identities: &live_identities,
         };
         unsafe {
             let _ = EnumDisplayMonitors(
