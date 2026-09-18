@@ -2622,10 +2622,14 @@ fn set_monitor_scale_windows(device_name: &str, scale_percent: u32) -> Result<()
         ));
     }
 
-    // Write to registry for persistence across reboots
-    // Calculate DPI value: scale_percent% = dpi_value/96 * 100
-    // So dpi_value = scale_percent * 96 / 100
-    let dpi_value = (scale_percent * 96 / 100) as u32;
+    // Write to registry for persistence across reboots.
+    // Windows stores PerMonitorSettings\...\DpiValue as a step offset from the
+    // display's recommended scale (0 = recommended, negative = steps below), NOT as
+    // an absolute DPI: WinDisplay's own untouched keys hold 0x0 / 0xffffffff / -5.
+    // The old formula (scale_percent * 96 / 100, e.g. 144 for 150%) is far outside
+    // that range, so whenever Windows re-read the value it clamped to the display's
+    // maximum scale - 350% at 3840x2160 - and the panel lost its mode with it.
+    let dpi_value = rel as u32;
 
     // Get the monitor's device path for registry key lookup
     if let Some(device_path) = get_monitor_registry_id(target_adapter_id, target_id) {
