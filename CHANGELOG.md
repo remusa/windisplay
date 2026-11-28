@@ -2,6 +2,7 @@
 
 All notable changes to this project will be documented in this file.
 
+<<<<<<< HEAD
 ## [0.3.25-fork.1] - 2026-09-18
 
 - Persist the per-monitor scale in the encoding Windows actually uses. `HKCU\Control Panel\Desktop\PerMonitorSettings\<monitor>\DpiValue` is a step offset from the display's recommended scale (0 = recommended, negative = steps below), not an absolute DPI. Writing `scale_percent * 96 / 100` (144 for 150%, 192 for 200%) put the value far out of range, and the next time Windows re-read it (monitor reconnect, input switch, wake, logon) it clamped to the display's maximum scale - 350% at 3840x2160 - with the mode falling back too (240Hz -> 60Hz). The value written is now the same recommended-relative step that is already sent in the `SET_DPI_SCALE` packet.
@@ -20,6 +21,13 @@ All notable changes to this project will be documented in this file.
 
 - Fix VideoOutputTechnology mapping: values 1-7 were shifted vs D3DKMDT standard (e.g., VOT=5 is DVI not HDMI)
 - Add EnumDisplayMonitors fallback for display detection to find monitors missed by EnumDisplayDevicesW when DISPLAY_DEVICE_ATTACHED_TO_DESKTOP is not set (fixes missing monitors on DisplayPort)
+=======
+## [0.3.22] - 2026-11-15
+
+- Add configurable global brightness shortcuts, with F14/F15 as defaults
+- Report shortcuts that Windows cannot register in Settings
+- Improve Settings dialog scrolling and layout
+>>>>>>> upstream/main
 
 ## [0.3.21] - 2026-06-09
 
